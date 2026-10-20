@@ -157,6 +157,48 @@ select_swap_backend() {
   return 0
 }
 
+## Pure: map a swapon SIZE field ("2G", "1024M") to a rounded integer GB on
+## stdout and return 0; print nothing and return 1 for an unrecognized unit.
+## No I/O -- unit-tested (swap-file-creator-tests).
+swap_size_field_to_gb() {
+  local field gb
+  field="$1"
+  if [[ "$field" == *G ]]; then
+    gb="${field%G}"
+  elif [[ "$field" == *M ]]; then
+    gb="$(bc <<< "scale=2; ${field%M} / 1024")"
+  else
+    return 1
+  fi
+  printf '%.0f\n' "$gb"
+  return 0
+}
+
+## Pure: true (0) if the target swap size (GB) fits the free disk space (GB,
+## already including the caller's +2 GB headroom). Caller logs + aborts on false.
+swap_fits_free_disk() {
+  [ "$1" -lt "$2" ]
+}
+
+## Pure: true (0) if the kernel-reported size (GB, +1 headroom) is at least the
+## target size (GB) -- the post-swapon size self-check.
+swap_size_self_check_ok() {
+  [ "$1" -ge "$2" ]
+}
+
+## Pure: true (0) if the path is absolute.
+swapfile_path_is_absolute() {
+  [[ "$1" = /* ]]
+}
+
+## Pure safety gate: true (0) ONLY when swapoff succeeded (exit code '0'), i.e.
+## the swap is no longer active and the file may be shredded/removed. False for
+## any non-zero code -- shredding/removing a still-active swap file would corrupt
+## live memory and can crash the box. Unit-tested.
+swap_safe_to_remove() {
+  [ "$1" = '0' ]
+}
+
 do_stop() {
    local swapon_output swapoff_exitcode
    swapoff_exitcode='0'
@@ -173,7 +215,7 @@ do_stop() {
 
    ## Avoid shredding the swapfile if swapoff failed, as doing so could shred
    ## actively in-use memory and crash the system.
-   if [ ! "$swapoff_exitcode" = '0' ]; then
+   if ! swap_safe_to_remove "$swapoff_exitcode"; then
       return 0
    fi
 
@@ -220,7 +262,7 @@ do_start() {
       log "INFO: See: https://www.kicksecure.com/wiki/swap-file-creator"
    fi
 
-   if ! [[ "$SWAPFILE" = /* ]]; then
+   if ! swapfile_path_is_absolute "$SWAPFILE"; then
       log "ERROR: 'SWAPFILE' value '$SWAPFILE' is not an absolute path. Swap file not enabled." >&2
       exit 1
    fi
@@ -334,7 +376,7 @@ do_start() {
    free_disk_space_in_gb=$(df "$dirname_swapfile" | awk 'NR==2 {print int($4/1024/1024)}')
    free_disk_space_in_gb_plus=$(( free_disk_space_in_gb + 2 ))
 
-   if [ "$swap_file_size_gb" -ge "$free_disk_space_in_gb_plus" ]; then
+   if ! swap_fits_free_disk "$swap_file_size_gb" "$free_disk_space_in_gb_plus"; then
       log "ERROR: Only $free_disk_space_in_gb GB free disk space. Insufficient to create $swap_file_size_gb GB sized swap file. Swap file not enabled." >&2
       exit 1
    fi
@@ -398,15 +440,8 @@ do_start() {
    #swapon_line="/var/swapfile 1024M"
    swap_file_size_with_unit=$(awk '{print $NF}' <<< "$swapon_line")
 
-   # Check if the size is in GB or MB and convert accordingly
-   if [[ $swap_file_size_with_unit == *G ]]; then
-      # If size ends with 'G', remove the 'G'
-      swap_file_kernel_reported_size_gb=${swap_file_size_with_unit%G}
-   elif [[ $swap_file_size_with_unit == *M ]]; then
-      # If size ends with 'M', remove the 'M' and divide by 1024
-      swap_file_size_in_mb=${swap_file_size_with_unit%M}
-      swap_file_kernel_reported_size_gb=$(bc <<< "scale=2; $swap_file_size_in_mb / 1024")
-   else
+   local swap_file_kernel_reported_size_gb_rounded_up
+   if ! swap_file_kernel_reported_size_gb_rounded_up="$(swap_size_field_to_gb "$swap_file_size_with_unit")"; then
       log "\
 INFO: Minor note (not an error).
 Swap file has been enabled; the size self-check was skipped.
@@ -418,12 +453,10 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
       return 0
    fi
 
-   swap_file_kernel_reported_size_gb_rounded_up="$(printf "%.0f\n" "$swap_file_kernel_reported_size_gb")"
-
    local swap_file_kernel_reported_size_gb_plus
    swap_file_kernel_reported_size_gb_plus=$(( swap_file_kernel_reported_size_gb_rounded_up + 1 ))
 
-   if [ "$swap_file_kernel_reported_size_gb_plus" -ge "$swap_file_target_size_gb" ]; then
+   if swap_size_self_check_ok "$swap_file_kernel_reported_size_gb_plus" "$swap_file_target_size_gb"; then
       log "INFO: File '$SWAPFILE' ($swap_file_size_gb GB) created and enabled. OK."
       return 0
    fi
