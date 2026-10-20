@@ -1,24 +1,17 @@
-#!/bin/bash
+#!/bin/bash -e
 
-## Copyright (C) 2012 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## Copyright (C) 2012 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
 #set -x
 
-set -e
-set -o pipefail
-set -o errtrace
-set -o nounset
-
-## https://forums.whonix.org/t/swap-file-creator-error/21128/3
-## avoid printf error
-#bash: printf: 3.14: invalid number
-##
-## Does not work:
-#export LANG=C
-## https://unix.stackexchange.com/questions/576701/what-is-the-difference-between-lang-c-and-lc-all-c
-LC_ALL=C
-export LC_ALL
+## provides was_executed
+# shellcheck source=../../libexec/helper-scripts/check_runtime.bsh
+source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/check_runtime.bsh || true
+if ! declare -F was_executed >/dev/null; then
+   printf '%s\n' "$0: ERROR: cannot source check_runtime.bsh!" >&2
+   exit 1
+fi
 
 pre_check_done='false'
 
@@ -57,8 +50,6 @@ error_handler() {
    exit 1
 }
 
-trap "error_handler" ERR
-
 exit_handler() {
    local exit_code="$?"
    if [ "$exit_code" = "0" ]; then
@@ -68,11 +59,6 @@ exit_handler() {
    fi
    exit "$exit_code"
 }
-
-trap exit_handler EXIT
-
-## sets: live_status_detected
-source /usr/libexec/helper-scripts/live-mode.sh
 
 sanity_tests() {
   local cmd_list cmd
@@ -140,6 +126,35 @@ set_defaults() {
   [[ -v "ENOUGH_RAM" ]] || ENOUGH_RAM="1950"
   [[ -v "SWAP_FILE_SIZE_CUSTOM_MB" ]] || SWAP_FILE_SIZE_CUSTOM_MB=""
   [[ -v "DO_PRE_CHECK" ]] || DO_PRE_CHECK="yes"
+}
+
+## Pure decision: given the pre-check setting and probe results, decide whether
+## a swap file should be created. No side effects, no I/O -- unit-tested by
+## swap-file-creator-tests. Policy:
+##   - DO_PRE_CHECK != 'yes': caller opted out of the gate -> proceed.
+##   - Virtualizer 'xen' (likely Qubes): host already manages/encrypts swap -> skip.
+##   - Swapfile path not on a LUKS device: avoid plaintext swap -> skip.
+##   - Otherwise proceed.
+## Args: $1 do_pre_check ; $2 virt (systemd-detect-virt output, '' if none) ;
+##       $3 luks_ok ('yes' when the swapfile path sits on LUKS).
+## Echoes exactly one of: skip-xen | skip-no-luks | proceed
+select_swap_backend() {
+  local do_pre_check="$1" virt="$2" luks_ok="$3"
+
+  if [ "$do_pre_check" != 'yes' ]; then
+    printf '%s\n' 'proceed'
+    return 0
+  fi
+  if [ "$virt" = 'xen' ]; then
+    printf '%s\n' 'skip-xen'
+    return 0
+  fi
+  if [ "$luks_ok" != 'yes' ]; then
+    printf '%s\n' 'skip-no-luks'
+    return 0
+  fi
+  printf '%s\n' 'proceed'
+  return 0
 }
 
 do_stop() {
@@ -227,19 +242,38 @@ do_start() {
       systemd_detect_virt_output=""
    fi
 
-   if [ "$DO_PRE_CHECK" = 'yes' ]; then
-      if [ "$systemd_detect_virt_output" = "xen" ]; then
-         log "INFO: Virtualizer 'xen' detected. Could be 'Qubes'. Skipping swap-file-creator (no swap file will be created). Doing nothing, OK."
-         exit 0
-      fi
-
-      if ! luks-path-check "$SWAPFILE" &>/dev/null ; then
-         log "INFO: Encrypted disk (LUKS) detected for file '$SWAPFILE': no. Not creating a swap file (expected). Doing nothing, OK. See also: https://www.kicksecure.com/wiki/swap-file-creator"
-         exit 0
+   ## Probe LUKS only when the gate needs it (not under DO_PRE_CHECK=no, not on
+   ## xen): the pure select_swap_backend short-circuits before luks_ok there.
+   local luks_ok swap_backend_decision
+   luks_ok='unknown'
+   if [ "$DO_PRE_CHECK" = 'yes' ] && [ "$systemd_detect_virt_output" != 'xen' ]; then
+      if luks-path-check "$SWAPFILE" &>/dev/null ; then
+         luks_ok='yes'
       else
-         pre_check_done='true'
+         luks_ok='no'
       fi
    fi
+
+   swap_backend_decision="$(select_swap_backend "$DO_PRE_CHECK" "$systemd_detect_virt_output" "$luks_ok")"
+   case "$swap_backend_decision" in
+      skip-xen)
+         log "INFO: Virtualizer 'xen' detected. Could be 'Qubes'. Skipping swap-file-creator (no swap file will be created). Doing nothing, OK."
+         exit 0
+         ;;
+      skip-no-luks)
+         log "INFO: Encrypted disk (LUKS) detected for file '$SWAPFILE': no. Not creating a swap file (expected). Doing nothing, OK. See also: https://www.kicksecure.com/wiki/swap-file-creator"
+         exit 0
+         ;;
+      proceed)
+         if [ "$DO_PRE_CHECK" = 'yes' ]; then
+            pre_check_done='true'
+         fi
+         ;;
+      *)
+         log "ERROR: Unexpected swap backend decision '$swap_backend_decision'. Swap file not enabled." >&2
+         exit 1
+         ;;
+   esac
 
    ## User can set HIBERNATION=yes in /etc/default/swap-file-creator
    [[ -v "HIBERNATION" ]] || HIBERNATION="$hibernation_consideration"
@@ -400,36 +434,62 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
    exit 1
 }
 
-if [ "$live_status_detected" = "true" ]; then
-  true "INFO: live mode detected. Swap file creation skipped."
-  exit 0
+main() {
+   set -o errexit
+   set -o nounset
+   set -o pipefail
+   set -o errtrace
+   shopt -s inherit_errexit
+   shopt -s shift_verbose
+
+   ## https://forums.whonix.org/t/swap-file-creator-error/21128/3
+   ## avoid printf error "bash: printf: 3.14: invalid number".
+   ## LANG=C does not suffice:
+   ## https://unix.stackexchange.com/questions/576701/what-is-the-difference-between-lang-c-and-lc-all-c
+   export LC_ALL=C
+
+   trap "error_handler" ERR
+   trap exit_handler EXIT
+
+   ## sets: live_status_detected
+   source /usr/libexec/helper-scripts/live-mode.sh
+
+   if [ "$live_status_detected" = "true" ]; then
+      true "INFO: live mode detected. Swap file creation skipped."
+      exit 0
+   fi
+
+   sanity_tests
+   source_config_files
+   set_defaults
+
+   if ! [ "$(id -u)" = 0 ]; then
+      log "$0: ERROR: Must be run as root/sudo." >&2
+      exit 1
+   fi
+
+   if [ $# -eq 0 ]; then
+      log "ERROR: No arguments provided." >&2
+      log "Usage: $0 (start|stop)" >&2
+      exit 1
+   fi
+
+   case "$1" in
+      start)
+         do_start
+         ;;
+      stop)
+         do_stop
+         ;;
+      *)
+         log "ERROR: Invalid argument: $1" >&2
+         log "Usage: $0 (start|stop)" >&2
+         exit 1
+         ;;
+   esac
+}
+
+## Only auto-run when executed, not when sourced (unit tests source it).
+if was_executed "${BASH_SOURCE[0]}"; then
+   main "$@"
 fi
-
-sanity_tests
-source_config_files
-set_defaults
-
-if ! [ "$(id -u)" = 0 ]; then
-    log "$0: ERROR: Must be run as root/sudo." >&2
-    exit 1
-fi
-
-if [ $# -eq 0 ]; then
-    log "ERROR: No arguments provided." >&2
-    log "Usage: $0 (start|stop)" >&2
-    exit 1
-fi
-
-case "$1" in
-    start)
-        do_start
-        ;;
-    stop)
-        do_stop
-        ;;
-    *)
-        log "ERROR: Invalid argument: $1" >&2
-        log "Usage: $0 (start|stop)" >&2
-        exit 1
-        ;;
-esac
