@@ -55,7 +55,7 @@ jobs:
           path: helper-scripts
 
       - name: install dependencies
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends btrfs-progs util-linux bc python3
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends btrfs-progs util-linux bc python3 safe-rm
 
       - name: run real-kernel swap e2e (root)
         run: |
