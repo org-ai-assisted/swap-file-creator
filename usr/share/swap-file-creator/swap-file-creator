@@ -199,12 +199,29 @@ swap_safe_to_remove() {
   [ "$1" = '0' ]
 }
 
+## Pure: from swapon listing text ($1), return the record whose FIRST field (the
+## swap NAME/path) equals $2 EXACTLY -- not a substring, so "/var/swapfile" never
+## matches "/var/swapfile-old". Last match wins (mirrors the old 'tail -n1');
+## empty when none. Pure shell -- no awk/grep (the quoted "$2 " keeps any glob
+## char in the path literal; the trailing '*' absorbs column padding). Unit-tested.
+swapon_record_for() {
+  local line found=''
+  while IFS= read -r line; do
+    case "$line" in
+      "$2 "* | "$2")
+        found="$line"
+        ;;
+    esac
+  done <<< "$1"
+  printf '%s\n' "$found"
+}
+
 do_stop() {
    local swapon_output swapoff_exitcode
    swapoff_exitcode='0'
    swapon_output="$(swapon 2>/dev/null)" || true
    if [ -f "$SWAPFILE" ]; then
-      if grep --fixed-strings -- "$SWAPFILE" < <(printf '%b' "$swapon_output") &>/dev/null; then
+      if [ -n "$(swapon_record_for "$(printf '%b' "$swapon_output")" "$SWAPFILE")" ]; then
          swapoff "$SWAPFILE" || { swapoff_exitcode="$?"; true; };
       fi
 
@@ -351,7 +368,9 @@ do_start() {
 
    local total_disk_space_in_mb
    dirname_swapfile="${SWAPFILE%/*}"
-   total_disk_space_in_mb=$(df "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
+   ## df -P: POSIX one-line-per-fs output, so a long mapper device name cannot
+   ## wrap onto a second line and shift the NR==2 fields.
+   total_disk_space_in_mb=$(df -P "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
 
    local swap_file_target_size_mb
    if [ "$SWAP_FILE_SIZE_CUSTOM_MB" = "" ]; then
@@ -373,7 +392,7 @@ do_start() {
 
    local free_disk_space_in_gb
    local free_disk_space_in_gb_plus
-   free_disk_space_in_gb=$(df "$dirname_swapfile" | awk 'NR==2 {print int($4/1024/1024)}')
+   free_disk_space_in_gb=$(df -P "$dirname_swapfile" | awk 'NR==2 {print int($4/1024/1024)}')
    free_disk_space_in_gb_plus=$(( free_disk_space_in_gb + 2 ))
 
    if ! swap_fits_free_disk "$swap_file_size_gb" "$free_disk_space_in_gb_plus"; then
@@ -382,7 +401,9 @@ do_start() {
    fi
 
    local swap_file_target_size_bytes
-   swap_file_target_size_bytes=$((swap_file_target_size_mb * 1000000))
+   ## MiB -> bytes. calculate-swap-size works in MiB (it does ram_mb / 1024 to
+   ## get GB), so the multiplier is 1024*1024, not decimal 1000000.
+   swap_file_target_size_bytes=$((swap_file_target_size_mb * 1048576))
 
    local swap_file_target_size_gb
    swap_file_target_size_gb="$(bc <<< "scale=2; $swap_file_target_size_bytes/1024/1024/1024")"
@@ -399,7 +420,8 @@ do_start() {
       ## > swapon: /var/swapfile: swapon failed: Invalid argument
       ## https://unix.stackexchange.com/questions/599949/swapfile-swapon-invalid-argument
       ## https://btrfs.readthedocs.io/en/latest/Swapfile.html
-      btrfs filesystem mkswapfile --size "${swap_file_target_size_gb}G" "$SWAPFILE"
+      ## Size in BYTES (not rounded GB): a sub-1-GB target rounds to 0G otherwise.
+      btrfs filesystem mkswapfile --size "$swap_file_target_size_bytes" "$SWAPFILE"
    else
       ## We need to check the size of $SWAPFILE, because a previous run of fallocate that
       ## got interrupted for some reason might have only created a smaller file
@@ -435,7 +457,7 @@ do_start() {
    ## output by swapon_line is not predictable, G vs M as unit.
    local swapon_line
    swapon_line="$(swapon --noheadings --raw --show=NAME,SIZE)"
-   swapon_line="$(printf '%b' "$swapon_line" | grep --fixed-strings -- "$SWAPFILE" | tail -n1)" || true
+   swapon_line="$(swapon_record_for "$(printf '%b' "$swapon_line")" "$SWAPFILE")" || true
    ## example swapon_line:
    #swapon_line="/var/swapfile 1024M"
    swap_file_size_with_unit=$(awk '{print $NF}' <<< "$swapon_line")
