@@ -174,8 +174,9 @@ swap_size_field_to_gb() {
   return 0
 }
 
-## Pure: true (0) if the target swap size (GB) fits the free disk space (GB,
-## already including the caller's +2 GB headroom). Caller logs + aborts on false.
+## Pure: true (0) if the required amount ($1) is strictly less than the
+## available amount ($2) -- same unit on both sides (the caller passes bytes:
+## target + headroom vs free + reclaimable). Caller logs + aborts on false.
 swap_fits_free_disk() {
   [ "$1" -lt "$2" ]
 }
@@ -380,12 +381,6 @@ do_start() {
       exit 0
    fi
 
-   local swap_file_actual_size_in_mb
-   swap_file_actual_size_in_mb="$(( swap_file_actual_size_in_bytes / 1024 / 1024 ))"
-
-   ## Never mind eventual small platform specific rounding errors.
-   swap_file_actual_size_in_mb="$(( swap_file_actual_size_in_mb + 2 ))"
-
    local total_disk_space_in_mb
    dirname_swapfile="${SWAPFILE%/*}"
    ## df -P: POSIX one-line-per-fs output, so a long mapper device name cannot
@@ -410,20 +405,29 @@ do_start() {
    local swap_file_size_gb
    swap_file_size_gb=$(bc <<< "scale=0; $swap_file_target_size_mb / 1024")
 
-   local free_disk_space_in_gb
-   local free_disk_space_in_gb_plus
-   free_disk_space_in_gb=$(df -P "$dirname_swapfile" | awk 'NR==2 {print int($4/1024/1024)}')
-   free_disk_space_in_gb_plus=$(( free_disk_space_in_gb + 2 ))
-
-   if ! swap_fits_free_disk "$swap_file_size_gb" "$free_disk_space_in_gb_plus"; then
-      log "ERROR: Only $free_disk_space_in_gb GB free disk space. Insufficient to create $swap_file_size_gb GB sized swap file. Swap file not enabled." >&2
-      exit 1
-   fi
-
    local swap_file_target_size_bytes
    ## MiB -> bytes. calculate-swap-size works in MiB (it does ram_mb / 1024 to
    ## get GB), so the multiplier is 1024*1024, not decimal 1000000.
    swap_file_target_size_bytes=$((swap_file_target_size_mb * 1048576))
+
+   ## Free-space sufficiency check in BYTES. 'df -P --block-size=1' avoids both
+   ## the GiB truncation (which, with the +2 GiB headroom mistakenly added to
+   ## AVAILABLE, could approve a swap ~2 GiB over free) and the POSIXLY_CORRECT
+   ## 512-byte rescale a 1K-block read suffers. Headroom is required ON TOP of
+   ## the target, not added to available. Credit the existing managed swap
+   ## file's bytes: do_stop reclaims that exact path before allocation, so its
+   ## current size is free for the new file -- a restart on a full-ish disk is
+   ## idempotent instead of falsely failing.
+   local free_disk_space_in_bytes effective_free_in_bytes headroom_in_bytes required_in_bytes
+   free_disk_space_in_bytes=$(df -P --block-size=1 "$dirname_swapfile" | awk 'NR==2 {print $4}')
+   headroom_in_bytes=$(( 2 * 1024 * 1024 * 1024 ))
+   effective_free_in_bytes=$(( free_disk_space_in_bytes + swap_file_actual_size_in_bytes ))
+   required_in_bytes=$(( swap_file_target_size_bytes + headroom_in_bytes ))
+
+   if ! swap_fits_free_disk "$required_in_bytes" "$effective_free_in_bytes"; then
+      log "ERROR: Insufficient free disk space: need ${required_in_bytes} bytes (swap ${swap_file_size_gb} GB + 2 GB headroom), have ${effective_free_in_bytes} bytes (${free_disk_space_in_bytes} free + ${swap_file_actual_size_in_bytes} reclaimable). Swap file not enabled." >&2
+      exit 1
+   fi
 
    local swap_file_target_size_gb
    swap_file_target_size_gb="$(bc <<< "scale=2; $swap_file_target_size_bytes/1024/1024/1024")"
@@ -453,17 +457,10 @@ do_start() {
       ## Size in BYTES (not rounded GB): a sub-1-GB target rounds to 0G otherwise.
       btrfs filesystem mkswapfile --size "$swap_file_target_size_bytes" "$SWAPFILE"
    else
-      ## We need to check the size of $SWAPFILE, because a previous run of fallocate that
-      ## got interrupted for some reason might have only created a smaller file
-      ## (0 MB in worst case).
-      ## fallocate is fast. Maybe no more test needed.
-      #if [ "$swap_file_target_size_mb" -lt "$swap_file_actual_size_in_mb" ]; then
-          ## Not exact.
-          ## For example 6144 MB would only be 5.7 G in "sudo swapon --show".
-          #fallocate --length "${swap_file_target_size_mb}MB" "$SWAPFILE"
-          ## Hence calculate in bytes.
-          fallocate --length "$swap_file_target_size_bytes" "$SWAPFILE"
-      #fi
+      ## Allocate in BYTES, not "${mb}MB": fallocate's MB suffix is decimal, so
+      ## e.g. 6144 MB yields only ~5.7 GiB in 'swapon --show'. do_stop above
+      ## already reclaimed any prior (possibly truncated) file.
+      fallocate --length "$swap_file_target_size_bytes" "$SWAPFILE"
    fi
 
    chown --recursive root:root -- "$SWAPFILE"
