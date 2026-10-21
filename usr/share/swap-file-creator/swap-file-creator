@@ -15,9 +15,6 @@ if ! declare -F was_executed >/dev/null; then
 fi
 
 pre_check_done='false'
-## Set 'true' only between a successful enabling swapon and the moment all
-## post-enable checks pass; a failure while it is set rolls the swap back.
-swap_enabled_this_run='false'
 
 log() {
   if [ "${VERBOSE-}" = "yes" ]; then
@@ -31,10 +28,6 @@ log() {
 error_handler() {
    local exit_code="$?"
    trap "" ERR
-   if [ "${swap_enabled_this_run:-false}" = 'true' ]; then
-      swap_enabled_this_run='false'
-      swap_rollback
-   fi
    log "\
 ###############################################################################
 ## Swap File Creator ERROR
@@ -68,9 +61,10 @@ exit_handler() {
    exit "$exit_code"
 }
 
-## Roll back a swap that THIS invocation enabled, when a later step fails -- a
-## failed start must not leave an unmanaged active swap behind. Best-effort:
-## the start is already failing, so a swapoff error here only adds a log line.
+## Roll back the swap THIS start enabled, when the post-swapon size self-check
+## proves the file is the WRONG size -- a mis-sized swap must not be left active
+## behind a failed start. Best-effort: the start is already failing, so a
+## swapoff error here only adds a log line.
 swap_rollback() {
    log "INFO: Rolling back: deactivating swap '$SWAPFILE' enabled during this failed start." >&2
    swapoff "$SWAPFILE" || log "ERROR: Rollback swapoff of '$SWAPFILE' failed." >&2
@@ -513,19 +507,19 @@ do_start() {
    fi
 
    swapon "$SWAPFILE" $SWAPON_EXTRA
-   ## Swap is now active. Any later failure (enumeration, parse, or the size
-   ## self-check) must roll it back, not leave an unmanaged active swap behind a
-   ## failed start. Cleared only after all post-enable checks pass.
-   swap_enabled_this_run='true'
 
+   ## Swap is now active. The size self-check below is BEST EFFORT: a failure to
+   ## READ or PARSE the size keeps the enabled swap and skips the check (never
+   ## tears down healthy swap over a cosmetic read), so the enumeration/parse
+   ## are guarded with '|| true'. Only a size proven WRONG rolls back.
    ## /proc/swap does not show the label.
    ## output by swapon_line is not predictable, G vs M as unit.
    local swapon_line
-   swapon_line="$(swapon --noheadings --raw --show=NAME,SIZE)"
+   swapon_line="$(swapon --noheadings --raw --show=NAME,SIZE)" || true
    swapon_line="$(swapon_record_for "$(printf '%b' "$swapon_line")" "$SWAPFILE")" || true
    ## example swapon_line:
    #swapon_line="/var/swapfile 1024M"
-   swap_file_size_with_unit=$(awk '{print $NF}' <<< "$swapon_line")
+   swap_file_size_with_unit=$(awk '{print $NF}' <<< "$swapon_line") || true
 
    local swap_file_kernel_reported_size_gb_rounded_up
    if ! swap_file_kernel_reported_size_gb_rounded_up="$(swap_size_field_to_gb "$swap_file_size_with_unit")"; then
@@ -538,7 +532,6 @@ reported an unexpected unit for file '$SWAPFILE' (not M or G).
 swapon_line: '$swapon_line'
 swap_file_size_with_unit: '$swap_file_size_with_unit'"
       ## Swap is enabled and kept; only the optional size self-check was skipped.
-      swap_enabled_this_run='false'
       return 0
    fi
 
@@ -547,8 +540,6 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
 
    if swap_size_self_check_ok "$swap_file_kernel_reported_size_gb_plus" "$swap_file_target_size_gb"; then
       log "INFO: File '$SWAPFILE' ($swap_file_size_gb GB) created and enabled. OK."
-      ## All post-enable checks passed; keep the swap, disarm rollback.
-      swap_enabled_this_run='false'
       return 0
    fi
 
@@ -557,7 +548,6 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
    log "swap_file_target_size_gb: '$swap_file_target_size_gb'" >&2
    ## Mis-sized swap is a failed start: roll it back instead of leaving a
    ## wrong-size active swap behind the error.
-   swap_enabled_this_run='false'
    swap_rollback
    exit 1
 }
