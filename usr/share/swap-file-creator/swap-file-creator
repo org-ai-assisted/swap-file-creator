@@ -19,7 +19,11 @@ log() {
     printf '%s\n' "$@"
     return 0
   fi
-  printf '%s\n' "$0: $@" | systemd-cat
+  ## A logger must never abort the program: under pipefail+errexit+errtrace a
+  ## failing 'systemd-cat' would fire the ERR trap on this pipeline before the
+  ## 'return 0', killing a caller mid-rollback (swap_rollback logs before it
+  ## swapoffs). Guard it so log() is always fail-safe.
+  printf '%s\n' "$0: $@" | systemd-cat || true
   return 0
 }
 
@@ -292,7 +296,15 @@ do_stop() {
    ## whether or not this invocation created it. A skipped start (xen/no-luks)
    ## still arms this via the oneshot's ExecStop; removing the managed path is
    ## the intended cleanup.
-   safe-rm --force -- "$SWAPFILE"
+   ## safe-rm failure must be LOUD. do_start calls do_stop as 'if ! do_stop',
+   ## which disables errexit for this whole function, so an unchecked failure
+   ## here would fall through to 'return 0' -- do_stop would falsely report
+   ## success and do_start would recreate swap over the undeleted (wrong-size)
+   ## file. Check explicitly and fail closed regardless of the errexit context.
+   if ! safe-rm --force -- "$SWAPFILE"; then
+      log "ERROR: Failed to remove swap file '$SWAPFILE'." >&2
+      return 1
+   fi
 
    return 0
 }
