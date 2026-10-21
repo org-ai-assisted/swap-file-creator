@@ -10,7 +10,8 @@
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/check_runtime.bsh || true
 if ! declare -F was_executed >/dev/null; then
    printf '%s\n' "$0: ERROR: cannot source check_runtime.bsh!" >&2
-   exit 1
+   # shellcheck disable=SC2317  # exit is reached on the executed (non-sourced) path, where return fails
+   return 1 2>/dev/null || exit 1
 fi
 
 pre_check_done='false'
