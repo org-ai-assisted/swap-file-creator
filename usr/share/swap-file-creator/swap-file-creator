@@ -129,7 +129,9 @@ set_defaults() {
 ## Pure decision: given the pre-check setting and probe results, decide whether
 ## a swap file should be created. No side effects, no I/O -- unit-tested by
 ## swap-file-creator-tests. Policy:
-##   - DO_PRE_CHECK != 'yes': caller opted out of the gate -> proceed.
+##   - DO_PRE_CHECK == 'no': caller opted out of the gate -> proceed. ANY other
+##     value keeps the gate ON (fail closed: a 'YES' typo must never silently
+##     allow plaintext swap).
 ##   - Virtualizer 'xen' (likely Qubes): host already manages/encrypts swap -> skip.
 ##   - Swapfile path not on a LUKS device: avoid plaintext swap -> skip.
 ##   - Otherwise proceed.
@@ -139,7 +141,7 @@ set_defaults() {
 select_swap_backend() {
   local do_pre_check="$1" virt="$2" luks_ok="$3"
 
-  if [ "$do_pre_check" != 'yes' ]; then
+  if [ "$do_pre_check" = 'no' ]; then
     printf '%s\n' 'proceed'
     return 0
   fi
@@ -215,11 +217,23 @@ swapon_record_for() {
 }
 
 do_stop() {
-   local swapon_output swapoff_exitcode
+   local swapon_output swapoff_exitcode swapon_listing_ok swap_is_active
    swapoff_exitcode='0'
-   swapon_output="$(swapon 2>/dev/null)" || true
+   swapon_listing_ok='yes'
+   swapon_output="$(swapon 2>/dev/null)" || swapon_listing_ok='no'
    if [ -f "$SWAPFILE" ]; then
-      if [ -n "$(swapon_record_for "$(printf '%b' "$swapon_output")" "$SWAPFILE")" ]; then
+      ## Prove inactivity before removal. Treat the file as inactive ONLY when
+      ## the swap enumeration SUCCEEDED and did not list it. A failed enumeration
+      ## cannot prove inactivity -> fall through to swapoff and require its
+      ## success (fail closed); never remove an unproven, possibly-active file.
+      if [ "$swapon_listing_ok" = 'yes' ] \
+         && [ -z "$(swapon_record_for "$(printf '%b' "$swapon_output")" "$SWAPFILE")" ]; then
+         swap_is_active='no'
+      else
+         swap_is_active='unknown'
+      fi
+
+      if [ "$swap_is_active" != 'no' ]; then
          swapoff "$SWAPFILE" || { swapoff_exitcode="$?"; true; };
       fi
 
@@ -228,8 +242,10 @@ do_stop() {
       #fi
    fi
 
-   ## Avoid removing the swapfile if swapoff failed: unlinking a still-active
-   ## swap file can corrupt live memory and crash the system.
+   ## Remove only when the swap is proven inactive: the enumeration listed it
+   ## absent, or swapoff returned 0. Any other case (swapoff failed, or the
+   ## enumeration failed and swapoff could not confirm) keeps the file --
+   ## unlinking a still-active swap file can corrupt live memory and crash the box.
    if ! swap_safe_to_remove "$swapoff_exitcode"; then
       return 0
    fi
@@ -309,7 +325,7 @@ do_start() {
    ## xen): the pure select_swap_backend short-circuits before luks_ok there.
    local luks_ok swap_backend_decision
    luks_ok='unknown'
-   if [ "$DO_PRE_CHECK" = 'yes' ] && [ "$systemd_detect_virt_output" != 'xen' ]; then
+   if [ "$DO_PRE_CHECK" != 'no' ] && [ "$systemd_detect_virt_output" != 'xen' ]; then
       if luks-path-check "$SWAPFILE" &>/dev/null ; then
          luks_ok='yes'
       else
@@ -328,7 +344,7 @@ do_start() {
          exit 0
          ;;
       proceed)
-         if [ "$DO_PRE_CHECK" = 'yes' ]; then
+         if [ "$DO_PRE_CHECK" != 'no' ]; then
             pre_check_done='true'
          fi
          ;;
