@@ -15,6 +15,9 @@ if ! declare -F was_executed >/dev/null; then
 fi
 
 pre_check_done='false'
+## Set 'true' only between a successful enabling swapon and the moment all
+## post-enable checks pass; a failure while it is set rolls the swap back.
+swap_enabled_this_run='false'
 
 log() {
   if [ "${VERBOSE-}" = "yes" ]; then
@@ -28,6 +31,10 @@ log() {
 error_handler() {
    local exit_code="$?"
    trap "" ERR
+   if [ "${swap_enabled_this_run:-false}" = 'true' ]; then
+      swap_enabled_this_run='false'
+      swap_rollback
+   fi
    log "\
 ###############################################################################
 ## Swap File Creator ERROR
@@ -59,6 +66,15 @@ exit_handler() {
       log "ERROR: END: with ERROR exit code: '$exit_code'" >&2
    fi
    exit "$exit_code"
+}
+
+## Roll back a swap that THIS invocation enabled, when a later step fails -- a
+## failed start must not leave an unmanaged active swap behind. Best-effort:
+## the start is already failing, so a swapoff error here only adds a log line.
+swap_rollback() {
+   log "INFO: Rolling back: deactivating swap '$SWAPFILE' enabled during this failed start." >&2
+   swapoff "$SWAPFILE" || log "ERROR: Rollback swapoff of '$SWAPFILE' failed." >&2
+   return 0
 }
 
 sanity_tests() {
@@ -192,6 +208,14 @@ swapfile_path_is_absolute() {
   [[ "$1" = /* ]]
 }
 
+## Pure: parent directory of the swap file path. "${1%/*}" strips the last
+## component but yields "" for a root-level file ("/swapfile" -> ""); such a
+## file's parent is "/". Caller passes an already-absolute path. Unit-tested.
+swapfile_parent_dir() {
+  local parent="${1%/*}"
+  printf '%s\n' "${parent:-/}"
+}
+
 ## Pure safety gate: true (0) ONLY when swapoff succeeded (exit code '0'), i.e.
 ## the swap is no longer active and the file may be removed. False for any
 ## non-zero code -- removing a still-active swap file would corrupt live memory
@@ -248,7 +272,10 @@ do_stop() {
    ## enumeration failed and swapoff could not confirm) keeps the file --
    ## unlinking a still-active swap file can corrupt live memory and crash the box.
    if ! swap_safe_to_remove "$swapoff_exitcode"; then
-      return 0
+      ## swapoff could not confirm the swap inactive. Fail LOUD, never hide it:
+      ## the standalone 'stop' dispatch surfaces this as a failed ExecStop, and
+      ## do_start aborts rather than overwrite a possibly-active swap file.
+      return 1
    fi
 
    if ! [ -f "$SWAPFILE" ]; then
@@ -369,7 +396,7 @@ do_start() {
    fi
 
    local folder_of_swapfile
-   folder_of_swapfile="${SWAPFILE%/*}"
+   folder_of_swapfile="$(swapfile_parent_dir "$SWAPFILE")"
 
    if ! test -d "$folder_of_swapfile" ; then
       log "ERROR: folder_of_swapfile '$folder_of_swapfile' does not exist." >&2
@@ -382,7 +409,7 @@ do_start() {
    fi
 
    local total_disk_space_in_mb
-   dirname_swapfile="${SWAPFILE%/*}"
+   dirname_swapfile="$folder_of_swapfile"
    ## df -P: POSIX one-line-per-fs output, so a long mapper device name cannot
    ## wrap onto a second line and shift the NR==2 fields.
    total_disk_space_in_mb=$(df -P "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
@@ -447,7 +474,14 @@ do_start() {
       fi
    fi
 
-   do_stop
+   ## Abort if do_stop could not deactivate an existing active swap at this
+   ## path: overwriting a live swap file (btrfs mkswapfile / fallocate+mkswap
+   ## below) can corrupt memory. do_stop returns nonzero only when swapoff
+   ## failed to confirm inactivity.
+   if ! do_stop; then
+      log "ERROR: Could not deactivate existing swap at '$SWAPFILE'; refusing to overwrite a possibly-active swap file. Swap file not enabled." >&2
+      exit 1
+   fi
 
    if [ "$fileystem_type" = "btrfs" ]; then
       ## Need to use 'btrfs'. Otherwise, 'swapon "$SWAPFILE" $SWAPON_EXTRA' would fail with:
@@ -479,6 +513,10 @@ do_start() {
    fi
 
    swapon "$SWAPFILE" $SWAPON_EXTRA
+   ## Swap is now active. Any later failure (enumeration, parse, or the size
+   ## self-check) must roll it back, not leave an unmanaged active swap behind a
+   ## failed start. Cleared only after all post-enable checks pass.
+   swap_enabled_this_run='true'
 
    ## /proc/swap does not show the label.
    ## output by swapon_line is not predictable, G vs M as unit.
@@ -499,6 +537,8 @@ Output of:
 reported an unexpected unit for file '$SWAPFILE' (not M or G).
 swapon_line: '$swapon_line'
 swap_file_size_with_unit: '$swap_file_size_with_unit'"
+      ## Swap is enabled and kept; only the optional size self-check was skipped.
+      swap_enabled_this_run='false'
       return 0
    fi
 
@@ -507,12 +547,18 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
 
    if swap_size_self_check_ok "$swap_file_kernel_reported_size_gb_plus" "$swap_file_target_size_gb"; then
       log "INFO: File '$SWAPFILE' ($swap_file_size_gb GB) created and enabled. OK."
+      ## All post-enable checks passed; keep the swap, disarm rollback.
+      swap_enabled_this_run='false'
       return 0
    fi
 
    log "ERROR: swap_file_kernel_reported_size_gb_plus is smaller than expected swap_file_target_size_gb!" >&2
    log "swap_file_kernel_reported_size_gb_plus: '$swap_file_kernel_reported_size_gb_plus'" >&2
    log "swap_file_target_size_gb: '$swap_file_target_size_gb'" >&2
+   ## Mis-sized swap is a failed start: roll it back instead of leaving a
+   ## wrong-size active swap behind the error.
+   swap_enabled_this_run='false'
+   swap_rollback
    exit 1
 }
 
