@@ -16,20 +16,6 @@
 ## no
 #VERBOSE="no"
 
-## Delete swapfile on shut down.
-## defaults to:
-## no
-## possible values:
-## yes
-## no
-#SHRED_ON_STOP="yes"
-
-## shred options
-#SHRED_OPTS="--verbose --iterations=3"
-
-## shred extra options
-#SHRED_EXTRA=""
-
 ## No change required unless you know what you are doing.
 #UUID="0615ba72-85b0-4183-8d54-300bb0d2e491"
 

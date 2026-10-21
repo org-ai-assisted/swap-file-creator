@@ -73,7 +73,6 @@ sanity_tests() {
     'mkswap'
     'swapon'
     'swapoff'
-    'shred'
     'cat'
     'test'
     'printf'
@@ -121,8 +120,6 @@ set_defaults() {
   #[[ -v "cryptsetup_pre_wrapper" ]] || cryptsetup_pre_wrapper="ld-system-preload-disable"
   [[ -v "SWAPON_EXTRA" ]] || SWAPON_EXTRA=""
   [[ -v "MKSWAP_EXTRA" ]] || MKSWAP_EXTRA=""
-  [[ -v "SHRED_ON_STOP" ]] || SHRED_ON_STOP="no"
-  [[ -v "SHRED_OPTS" ]] || SHRED_OPTS="--verbose --iterations=1"
   [[ -v "RANDOM_DEVICE" ]] || RANDOM_DEVICE="/dev/random"
   [[ -v "ENOUGH_RAM" ]] || ENOUGH_RAM="1950"
   [[ -v "SWAP_FILE_SIZE_CUSTOM_MB" ]] || SWAP_FILE_SIZE_CUSTOM_MB=""
@@ -193,9 +190,9 @@ swapfile_path_is_absolute() {
 }
 
 ## Pure safety gate: true (0) ONLY when swapoff succeeded (exit code '0'), i.e.
-## the swap is no longer active and the file may be shredded/removed. False for
-## any non-zero code -- shredding/removing a still-active swap file would corrupt
-## live memory and can crash the box. Unit-tested.
+## the swap is no longer active and the file may be removed. False for any
+## non-zero code -- removing a still-active swap file would corrupt live memory
+## and can crash the box. Unit-tested.
 swap_safe_to_remove() {
   [ "$1" = '0' ]
 }
@@ -231,8 +228,8 @@ do_stop() {
       #fi
    fi
 
-   ## Avoid shredding the swapfile if swapoff failed, as doing so could shred
-   ## actively in-use memory and crash the system.
+   ## Avoid removing the swapfile if swapoff failed: unlinking a still-active
+   ## swap file can corrupt live memory and crash the system.
    if ! swap_safe_to_remove "$swapoff_exitcode"; then
       return 0
    fi
@@ -241,12 +238,10 @@ do_stop() {
       return 0
    fi
 
-   if [ "$SHRED_ON_STOP" = "yes" ]; then
-      log "INFO: Shredding '$SWAPFILE' before removal... This may take a while..."
-      shred $SHRED_OPTS "$SWAPFILE"
-      log "INFO: Done shredding '$SWAPFILE'."
-   fi
-
+   ## By design: stop reclaims the configured SWAPFILE path unconditionally,
+   ## whether or not this invocation created it. A skipped start (xen/no-luks)
+   ## still arms this via the oneshot's ExecStop; removing the managed path is
+   ## the intended cleanup.
    ## TODO: Why is this needed?
 #    if [ "$DO_PRE_CHECK" = 'yes' ] \
 #       && [ "$pre_check_done" = 'false' ] \
@@ -411,12 +406,22 @@ do_start() {
    ## Round down to integer.
    swap_file_target_size_gb="$(printf "%.0f" "$swap_file_target_size_gb")"
 
-   do_stop
-
    fileystem_type=$(findmnt --noheadings --output FSTYPE --target "$folder_of_swapfile")
 
+   ## Verify the btrfs tool BEFORE do_stop destroys the existing swap: on a
+   ## btrfs system without btrfs-progs installed (no hard dep, since non-btrfs
+   ## systems do not need it) this fails cleanly instead of leaving no swap at
+   ## all after the old file was already removed.
    if [ "$fileystem_type" = "btrfs" ]; then
-      command -v "btrfs" >/dev/null
+      if ! command -v btrfs >/dev/null; then
+         log "ERROR: btrfs filesystem detected but the 'btrfs' tool is missing. Install btrfs-progs. Swap file not enabled." >&2
+         exit 1
+      fi
+   fi
+
+   do_stop
+
+   if [ "$fileystem_type" = "btrfs" ]; then
       ## Need to use 'btrfs'. Otherwise, 'swapon "$SWAPFILE" $SWAPON_EXTRA' would fail with:
       ## > swapon: /var/swapfile: swapon failed: Invalid argument
       ## https://unix.stackexchange.com/questions/599949/swapfile-swapon-invalid-argument
