@@ -280,6 +280,14 @@ do_start() {
       exit 1
    fi
 
+   ## Out of scope by design: the later fallocate/mkswap/chown/chmod follow a
+   ## symlink at SWAPFILE if one exists, so a swap file placed in a
+   ## user-writable directory could be redirected by an unprivileged user
+   ## (symlink TOCTOU, root-run). The default SWAPFILE is /var/swapfile, whose
+   ## parent is root-only, so this requires a deliberate misconfiguration (a
+   ## SWAPFILE under a world-writable path). Not hardened against here; keep
+   ## SWAPFILE in a root-owned directory.
+
    systemd_detect_virt_output=""
    if command -v systemd-detect-virt >/dev/null ; then
       if systemd_detect_virt_output="$(systemd-detect-virt 2>/dev/null)" ; then

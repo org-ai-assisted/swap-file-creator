@@ -29,9 +29,6 @@
 #SWAPON_EXTRA=""
 
 ## No change required unless you know what you are doing.
-#SWAPOFF_EXTRA=""
-
-## No change required unless you know what you are doing.
 #SWAPON_EXTRA="--verbose"
 
 ## No change required unless you know what you are doing.
@@ -42,8 +39,9 @@
 ## Currently does nothing.
 #MAPPER_FULL="/dev/mapper/$MAPPER"
 
-## Pass 'yes' or 'no' to calculate-swap-size.
-## Otherwise auto detected. 'no' in VMs. 'yes' otherwise.
+## Pass 'yes' or 'no' to calculate-swap-size for hibernation sizing.
+## Auto-detected default is 'no' (hibernation sizing disabled, VMs and
+## bare metal alike). Set 'yes' to size swap for hibernation.
 #HIBERNATION="no"
 
 ## Pass 'yes' or 'no' to enable or disable both:
