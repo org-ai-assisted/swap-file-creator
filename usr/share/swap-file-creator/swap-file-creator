@@ -14,8 +14,6 @@ if ! declare -F was_executed >/dev/null; then
    return 1 2>/dev/null || exit 1
 fi
 
-pre_check_done='false'
-
 log() {
   if [ "${VERBOSE-}" = "yes" ]; then
     printf '%s\n' "$@"
@@ -237,6 +235,20 @@ swapon_record_for() {
 
 do_stop() {
    local swapon_output swapoff_exitcode swapon_listing_ok swap_is_active
+   ## Fail closed on a non-absolute SWAPFILE: do_stop safe-rm's this path, so a
+   ## relative value (misconfig) must never reach safe-rm and delete a file in
+   ## the service's working directory. do_start validates this too; do_stop runs
+   ## independently as the unit's ExecStop, so it needs its own guard.
+   if ! swapfile_path_is_absolute "$SWAPFILE"; then
+      log "ERROR: 'SWAPFILE' value '$SWAPFILE' is not an absolute path. Refusing to operate." >&2
+      return 1
+   fi
+   ## Out of scope (keep SWAPFILE a plain root-owned path, no whitespace): swapon
+   ## mangles its listing (space -> \040, backslash -> \134) and swapon_record_for
+   ## matches after a 'printf %b' decode, so a second ACTIVE swap whose path is
+   ## "$SWAPFILE<space>..." would decode to a leading-space collision and be
+   ## treated as this file (fail CLOSED: do_stop then refuses, never deletes).
+   ## Not hardened against a pathological sibling swap path.
    swapoff_exitcode='0'
    swapon_listing_ok='yes'
    swapon_output="$(swapon 2>/dev/null)" || swapon_listing_ok='no'
@@ -280,15 +292,6 @@ do_stop() {
    ## whether or not this invocation created it. A skipped start (xen/no-luks)
    ## still arms this via the oneshot's ExecStop; removing the managed path is
    ## the intended cleanup.
-   ## TODO: Why is this needed?
-#    if [ "$DO_PRE_CHECK" = 'yes' ] \
-#       && [ "$pre_check_done" = 'false' ] \
-#       && ! luks-path-check "$SWAPFILE" &>/dev/null; then
-#       log "INFO: Removing '$SWAPFILE'..."
-#       safe-rm --force -- "$SWAPFILE"
-#       log "INFO: Done removing '$SWAPFILE'."
-#    fi
-
    safe-rm --force -- "$SWAPFILE"
 
    return 0
@@ -305,7 +308,7 @@ do_start() {
       log "INFO: Enough RAM available (at least $ENOUGH_RAM MB). OK."
    else
       if [ "${VERBOSE-}" = "no" ]; then
-         VERBOSE=true
+         VERBOSE=yes
          log "INFO: swap-file-creator..."
       fi
       log "INFO: Low RAM detected (less than $ENOUGH_RAM MB)."
@@ -366,9 +369,7 @@ do_start() {
          exit 0
          ;;
       proceed)
-         if [ "$DO_PRE_CHECK" != 'no' ]; then
-            pre_check_done='true'
-         fi
+         ## Gate passed (or opted out): fall through to swap creation.
          ;;
       *)
          log "ERROR: Unexpected swap backend decision '$swap_backend_decision'. Swap file not enabled." >&2
@@ -398,15 +399,17 @@ do_start() {
    fi
 
    if ! test -w "$folder_of_swapfile" ; then
-      true "INFO: File $SWAPFILE (actually folder $folder_of_swapfile) is not writeable. Maybe read-only file system? Exiting."
+      log "INFO: File $SWAPFILE (actually folder $folder_of_swapfile) is not writeable. Maybe read-only file system? Exiting."
       exit 0
    fi
 
    local total_disk_space_in_mb
    dirname_swapfile="$folder_of_swapfile"
    ## df -P: POSIX one-line-per-fs output, so a long mapper device name cannot
-   ## wrap onto a second line and shift the NR==2 fields.
-   total_disk_space_in_mb=$(df -P "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
+   ## wrap onto a second line and shift the NR==2 fields. -k pins 1K blocks: an
+   ## explicit block size overrides the POSIXLY_CORRECT 512-byte default, which
+   ## would otherwise halve $2's unit and double the computed MB.
+   total_disk_space_in_mb=$(df -P -k "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
 
    local swap_file_target_size_mb
    if [ "$SWAP_FILE_SIZE_CUSTOM_MB" = "" ]; then

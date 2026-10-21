@@ -14,7 +14,7 @@ Rules-Requires-Root: no
 
 Package: swap-file-creator
 Architecture: all
-Depends: helper-scripts, bc, safe-rm,
+Depends: helper-scripts, bc, safe-rm, procps,
  ${misc:Depends}
 ## Recommends: haveged, jitterentropy-rngd
 Description: Swap file creator for LUKS-encrypted systems
