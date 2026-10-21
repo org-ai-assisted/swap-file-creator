@@ -39,6 +39,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           path: swap-file-creator
+          persist-credentials: false
 
       - name: checkout dist-ai (e2e suite)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -46,6 +47,7 @@ jobs:
           repository: org-ai-assisted/dist-ai
           ref: ai
           path: dist-ai
+          persist-credentials: false
 
       - name: checkout helper-scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -53,6 +55,7 @@ jobs:
           repository: Kicksecure/helper-scripts
           ref: master
           path: helper-scripts
+          persist-credentials: false
 
       - name: install dependencies
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends btrfs-progs util-linux bc python3 safe-rm
