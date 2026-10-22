@@ -1,33 +1,32 @@
-#!/bin/bash
+#!/bin/bash -e
 
-## Copyright (C) 2012 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## Copyright (C) 2012 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
 #set -x
 
-set -e
-set -o pipefail
-set -o errtrace
-set -o nounset
-
-## https://forums.whonix.org/t/swap-file-creator-error/21128/3
-## avoid printf error
-#bash: printf: 3.14: invalid number
-##
-## Does not work:
-#export LANG=C
-## https://unix.stackexchange.com/questions/576701/what-is-the-difference-between-lang-c-and-lc-all-c
-LC_ALL=C
-export LC_ALL
-
-pre_check_done='false'
+## provides was_executed
+# shellcheck source=../../libexec/helper-scripts/check_runtime.bsh
+source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/check_runtime.bsh || true
+if ! declare -F was_executed >/dev/null; then
+   printf '%s\n' "$0: ERROR: cannot source check_runtime.bsh!" >&2
+   # shellcheck disable=SC2317  # exit is reached on the executed (non-sourced) path, where return fails
+   return 1 2>/dev/null || exit 1
+fi
 
 log() {
   if [ "${VERBOSE-}" = "yes" ]; then
-    printf '%s\n' "$@"
+    ## Fail-safe even on this branch: a write failure (e.g. stderr pointed at a
+    ## full disk) must not fire the ERR trap and abort a caller mid-rollback. Low
+    ## RAM forces VERBOSE=yes, so this is a normal runtime path, not just debug.
+    printf '%s\n' "$@" || true
     return 0
   fi
-  printf '%s\n' "$0: $@" | systemd-cat
+  ## A logger must never abort the program: under pipefail+errexit+errtrace a
+  ## failing 'systemd-cat' would fire the ERR trap on this pipeline before the
+  ## 'return 0', killing a caller mid-rollback (swap_rollback logs before it
+  ## swapoffs). Guard it so log() is always fail-safe.
+  printf '%s\n' "$0: $@" | systemd-cat || true
   return 0
 }
 
@@ -57,8 +56,6 @@ error_handler() {
    exit 1
 }
 
-trap "error_handler" ERR
-
 exit_handler() {
    local exit_code="$?"
    if [ "$exit_code" = "0" ]; then
@@ -69,10 +66,15 @@ exit_handler() {
    exit "$exit_code"
 }
 
-trap exit_handler EXIT
-
-## sets: live_status_detected
-source /usr/libexec/helper-scripts/live-mode.sh
+## Roll back the swap THIS start enabled, when the post-swapon size self-check
+## proves the file is the WRONG size -- a mis-sized swap must not be left active
+## behind a failed start. Best-effort: the start is already failing, so a
+## swapoff error here only adds a log line.
+swap_rollback() {
+   log "INFO: Rolling back: deactivating swap '$SWAPFILE' enabled during this failed start." >&2
+   swapoff "$SWAPFILE" || log "ERROR: Rollback swapoff of '$SWAPFILE' failed." >&2
+   return 0
+}
 
 sanity_tests() {
   local cmd_list cmd
@@ -86,7 +88,6 @@ sanity_tests() {
     'mkswap'
     'swapon'
     'swapoff'
-    'shred'
     'cat'
     'test'
     'printf'
@@ -134,20 +135,148 @@ set_defaults() {
   #[[ -v "cryptsetup_pre_wrapper" ]] || cryptsetup_pre_wrapper="ld-system-preload-disable"
   [[ -v "SWAPON_EXTRA" ]] || SWAPON_EXTRA=""
   [[ -v "MKSWAP_EXTRA" ]] || MKSWAP_EXTRA=""
-  [[ -v "SHRED_ON_STOP" ]] || SHRED_ON_STOP="no"
-  [[ -v "SHRED_OPTS" ]] || SHRED_OPTS="--verbose --iterations=1"
   [[ -v "RANDOM_DEVICE" ]] || RANDOM_DEVICE="/dev/random"
   [[ -v "ENOUGH_RAM" ]] || ENOUGH_RAM="1950"
   [[ -v "SWAP_FILE_SIZE_CUSTOM_MB" ]] || SWAP_FILE_SIZE_CUSTOM_MB=""
   [[ -v "DO_PRE_CHECK" ]] || DO_PRE_CHECK="yes"
 }
 
+## Pure decision: given the pre-check setting and probe results, decide whether
+## a swap file should be created. No side effects, no I/O -- unit-tested by
+## swap-file-creator-tests. Policy:
+##   - DO_PRE_CHECK == 'no': caller opted out of the gate -> proceed. ANY other
+##     value keeps the gate ON (fail closed: a 'YES' typo must never silently
+##     allow plaintext swap).
+##   - Virtualizer 'xen' (likely Qubes): host already manages/encrypts swap -> skip.
+##   - Swapfile path not on a LUKS device: avoid plaintext swap -> skip.
+##   - Otherwise proceed.
+## Args: $1 do_pre_check ; $2 virt (systemd-detect-virt output, '' if none) ;
+##       $3 luks_ok ('yes' when the swapfile path sits on LUKS).
+## Echoes exactly one of: skip-xen | skip-no-luks | proceed
+select_swap_backend() {
+  local do_pre_check="$1" virt="$2" luks_ok="$3"
+
+  if [ "$do_pre_check" = 'no' ]; then
+    printf '%s\n' 'proceed'
+    return 0
+  fi
+  if [ "$virt" = 'xen' ]; then
+    printf '%s\n' 'skip-xen'
+    return 0
+  fi
+  if [ "$luks_ok" != 'yes' ]; then
+    printf '%s\n' 'skip-no-luks'
+    return 0
+  fi
+  printf '%s\n' 'proceed'
+  return 0
+}
+
+## Pure: map a swapon SIZE field ("2G", "1024M") to a rounded integer GB on
+## stdout and return 0; print nothing and return 1 for an unrecognized unit.
+## No I/O -- unit-tested (swap-file-creator-tests).
+swap_size_field_to_gb() {
+  local field gb
+  field="$1"
+  if [[ "$field" == *G ]]; then
+    gb="${field%G}"
+  elif [[ "$field" == *M ]]; then
+    gb="$(bc <<< "scale=2; ${field%M} / 1024")"
+  else
+    return 1
+  fi
+  printf '%.0f\n' "$gb"
+  return 0
+}
+
+## Pure: true (0) if the required amount ($1) is strictly less than the
+## available amount ($2) -- same unit on both sides (the caller passes bytes:
+## target + headroom vs free + reclaimable). Caller logs + aborts on false.
+swap_fits_free_disk() {
+  [ "$1" -lt "$2" ]
+}
+
+## Pure: true (0) if the kernel-reported size (GB, +1 headroom) is at least the
+## target size (GB) -- the post-swapon size self-check.
+swap_size_self_check_ok() {
+  [ "$1" -ge "$2" ]
+}
+
+## Pure: true (0) if the path is absolute.
+swapfile_path_is_absolute() {
+  [[ "$1" = /* ]]
+}
+
+## Pure: parent directory of the swap file path. "${1%/*}" strips the last
+## component but yields "" for a root-level file ("/swapfile" -> ""); such a
+## file's parent is "/". Caller passes an already-absolute path. Unit-tested.
+swapfile_parent_dir() {
+  local parent="${1%/*}"
+  printf '%s\n' "${parent:-/}"
+}
+
+## Pure safety gate: true (0) ONLY when swapoff succeeded (exit code '0'), i.e.
+## the swap is no longer active and the file may be removed. False for any
+## non-zero code -- removing a still-active swap file would corrupt live memory
+## and can crash the box. Unit-tested.
+swap_safe_to_remove() {
+  [ "$1" = '0' ]
+}
+
+## Pure: from swapon listing text ($1), return the record whose FIRST field (the
+## swap NAME/path) equals $2 EXACTLY -- not a substring, so "/var/swapfile" never
+## matches "/var/swapfile-old". Last match wins (mirrors the old 'tail -n1');
+## empty when none. Pure shell -- no awk/grep (the quoted "$2 " keeps any glob
+## char in the path literal; the trailing '*' absorbs column padding). Unit-tested.
+swapon_record_for() {
+  local line found=''
+  while IFS= read -r line; do
+    case "$line" in
+      "$2 "* | "$2")
+        found="$line"
+        ;;
+    esac
+  done <<< "$1"
+  printf '%s\n' "$found"
+}
+
 do_stop() {
-   local swapon_output swapoff_exitcode
+   local swapon_output swapoff_exitcode swapon_listing_ok swap_is_active
+   ## Fail closed on a non-absolute SWAPFILE: do_stop safe-rm's this path, so a
+   ## relative value (misconfig) must never reach safe-rm and delete a file in
+   ## the service's working directory. do_start validates this too; do_stop runs
+   ## independently as the unit's ExecStop, so it needs its own guard.
+   if ! swapfile_path_is_absolute "$SWAPFILE"; then
+      log "ERROR: 'SWAPFILE' value '$SWAPFILE' is not an absolute path. Refusing to operate." >&2
+      return 1
+   fi
+   ## Match the swapon listing VERBATIM -- no 'printf %b' decode, which an escape
+   ## in ANY listed record ('\c' truncates printf, '\040'/'\n'/'\x5c' rewrite it)
+   ## could steer to hide this swap. A path NOT found here is treated as INACTIVE
+   ## and removed below WITHOUT a swapoff. That is correct for the SUPPORTED config
+   ## -- a plain, canonical, whitespace-free root-owned path, which the kernel
+   ## lists verbatim, so an ACTIVE such swap always matches and takes the
+   ## swapoff-confirmed path. An escaped / non-canonical ('/var/./swapfile') /
+   ## whitespace SWAPFILE (unsupported) may not match its own listing; if active,
+   ## safe-rm is attempted, but the kernel refuses to unlink a live swap
+   ## (IS_SWAPFILE -> EPERM), so do_stop fails and start aborts rather than
+   ## corrupting. Keep SWAPFILE a plain canonical path.
    swapoff_exitcode='0'
-   swapon_output="$(swapon 2>/dev/null)" || true
+   swapon_listing_ok='yes'
+   swapon_output="$(swapon 2>/dev/null)" || swapon_listing_ok='no'
    if [ -f "$SWAPFILE" ]; then
-      if grep --fixed-strings -- "$SWAPFILE" < <(printf '%b' "$swapon_output") &>/dev/null; then
+      ## Prove inactivity before removal. Treat the file as inactive ONLY when
+      ## the swap enumeration SUCCEEDED and did not list it. A failed enumeration
+      ## cannot prove inactivity -> fall through to swapoff and require its
+      ## success (fail closed); never remove an unproven, possibly-active file.
+      if [ "$swapon_listing_ok" = 'yes' ] \
+         && [ -z "$(swapon_record_for "$swapon_output" "$SWAPFILE")" ]; then
+         swap_is_active='no'
+      else
+         swap_is_active='unknown'
+      fi
+
+      if [ "$swap_is_active" != 'no' ]; then
          swapoff "$SWAPFILE" || { swapoff_exitcode="$?"; true; };
       fi
 
@@ -156,32 +285,43 @@ do_stop() {
       #fi
    fi
 
-   ## Avoid shredding the swapfile if swapoff failed, as doing so could shred
-   ## actively in-use memory and crash the system.
-   if [ ! "$swapoff_exitcode" = '0' ]; then
-      return 0
+   ## Remove only when the swap is proven inactive: the enumeration listed it
+   ## absent, or swapoff returned 0. Any other case (swapoff failed, or the
+   ## enumeration failed and swapoff could not confirm) keeps the file --
+   ## unlinking a still-active swap file can corrupt live memory and crash the box.
+   if ! swap_safe_to_remove "$swapoff_exitcode"; then
+      ## swapoff could not confirm the swap inactive. Fail LOUD, never hide it:
+      ## the standalone 'stop' dispatch surfaces this as a failed ExecStop, and
+      ## do_start aborts rather than overwrite a possibly-active swap file.
+      return 1
    fi
 
    if ! [ -f "$SWAPFILE" ]; then
       return 0
    fi
 
-   if [ "$SHRED_ON_STOP" = "yes" ]; then
-      log "INFO: Shredding '$SWAPFILE' before removal... This may take a while..."
-      shred $SHRED_OPTS "$SWAPFILE"
-      log "INFO: Done shredding '$SWAPFILE'."
+   ## By design: stop reclaims the configured SWAPFILE path unconditionally,
+   ## whether or not this invocation created it. A skipped start (xen/no-luks)
+   ## still arms this via the oneshot's ExecStop; removing the managed path is
+   ## the intended cleanup.
+   ## safe-rm failure must be LOUD. do_start calls do_stop as 'if ! do_stop',
+   ## which disables errexit for this whole function, so an unchecked failure
+   ## here would fall through to 'return 0' -- do_stop would falsely report
+   ## success and do_start would recreate swap over the undeleted (wrong-size)
+   ## file. Check explicitly and fail closed regardless of the errexit context.
+   if ! safe-rm --force -- "$SWAPFILE"; then
+      log "ERROR: Failed to remove swap file '$SWAPFILE'." >&2
+      return 1
    fi
 
-   ## TODO: Why is this needed?
-#    if [ "$DO_PRE_CHECK" = 'yes' ] \
-#       && [ "$pre_check_done" = 'false' ] \
-#       && ! luks-path-check "$SWAPFILE" &>/dev/null; then
-#       log "INFO: Removing '$SWAPFILE'..."
-#       safe-rm --force -- "$SWAPFILE"
-#       log "INFO: Done removing '$SWAPFILE'."
-#    fi
-
-   safe-rm --force -- "$SWAPFILE"
+   ## A zero safe-rm status is not proof of removal: safe-rm FILTERS a protected
+   ## operand (SWAPFILE listed in safe-rm config) and then runs 'rm --force' with
+   ## no operands, which exits 0. Verify the path is actually gone and fail closed
+   ## on the OUTCOME, or do_start would recreate swap over the undeleted file.
+   if [ -e "$SWAPFILE" ]; then
+      log "ERROR: Swap file '$SWAPFILE' still present after safe-rm (protected path?)." >&2
+      return 1
+   fi
 
    return 0
 }
@@ -197,7 +337,7 @@ do_start() {
       log "INFO: Enough RAM available (at least $ENOUGH_RAM MB). OK."
    else
       if [ "${VERBOSE-}" = "no" ]; then
-         VERBOSE=true
+         VERBOSE=yes
          log "INFO: swap-file-creator..."
       fi
       log "INFO: Low RAM detected (less than $ENOUGH_RAM MB)."
@@ -205,10 +345,18 @@ do_start() {
       log "INFO: See: https://www.kicksecure.com/wiki/swap-file-creator"
    fi
 
-   if ! [[ "$SWAPFILE" = /* ]]; then
+   if ! swapfile_path_is_absolute "$SWAPFILE"; then
       log "ERROR: 'SWAPFILE' value '$SWAPFILE' is not an absolute path. Swap file not enabled." >&2
       exit 1
    fi
+
+   ## Out of scope by design: the later fallocate/mkswap/chown/chmod follow a
+   ## symlink at SWAPFILE if one exists, so a swap file placed in a
+   ## user-writable directory could be redirected by an unprivileged user
+   ## (symlink TOCTOU, root-run). The default SWAPFILE is /var/swapfile, whose
+   ## parent is root-only, so this requires a deliberate misconfiguration (a
+   ## SWAPFILE under a world-writable path). Not hardened against here; keep
+   ## SWAPFILE in a root-owned directory.
 
    systemd_detect_virt_output=""
    if command -v systemd-detect-virt >/dev/null ; then
@@ -227,19 +375,36 @@ do_start() {
       systemd_detect_virt_output=""
    fi
 
-   if [ "$DO_PRE_CHECK" = 'yes' ]; then
-      if [ "$systemd_detect_virt_output" = "xen" ]; then
-         log "INFO: Virtualizer 'xen' detected. Could be 'Qubes'. Skipping swap-file-creator (no swap file will be created). Doing nothing, OK."
-         exit 0
-      fi
-
-      if ! luks-path-check "$SWAPFILE" &>/dev/null ; then
-         log "INFO: Encrypted disk (LUKS) detected for file '$SWAPFILE': no. Not creating a swap file (expected). Doing nothing, OK. See also: https://www.kicksecure.com/wiki/swap-file-creator"
-         exit 0
+   ## Probe LUKS only when the gate needs it (not under DO_PRE_CHECK=no, not on
+   ## xen): the pure select_swap_backend short-circuits before luks_ok there.
+   local luks_ok swap_backend_decision
+   luks_ok='unknown'
+   if [ "$DO_PRE_CHECK" != 'no' ] && [ "$systemd_detect_virt_output" != 'xen' ]; then
+      if luks-path-check "$SWAPFILE" &>/dev/null ; then
+         luks_ok='yes'
       else
-         pre_check_done='true'
+         luks_ok='no'
       fi
    fi
+
+   swap_backend_decision="$(select_swap_backend "$DO_PRE_CHECK" "$systemd_detect_virt_output" "$luks_ok")"
+   case "$swap_backend_decision" in
+      skip-xen)
+         log "INFO: Virtualizer 'xen' detected. Could be 'Qubes'. Skipping swap-file-creator (no swap file will be created). Doing nothing, OK."
+         exit 0
+         ;;
+      skip-no-luks)
+         log "INFO: Encrypted disk (LUKS) detected for file '$SWAPFILE': no. Not creating a swap file (expected). Doing nothing, OK. See also: https://www.kicksecure.com/wiki/swap-file-creator"
+         exit 0
+         ;;
+      proceed)
+         ## Gate passed (or opted out): fall through to swap creation.
+         ;;
+      *)
+         log "ERROR: Unexpected swap backend decision '$swap_backend_decision'. Swap file not enabled." >&2
+         exit 1
+         ;;
+   esac
 
    ## User can set HIBERNATION=yes in /etc/default/swap-file-creator
    [[ -v "HIBERNATION" ]] || HIBERNATION="$hibernation_consideration"
@@ -249,13 +414,13 @@ do_start() {
    if [ -f "$SWAPFILE" ]; then
       ## Sanity test.
       test -r "$SWAPFILE"
-      swap_file_actual_size_in_bytes="$(stat --format='%s' -- "$SWAPFILE")"
+      swap_file_actual_size_in_bytes=$(( $(stat --format='%b' -- "$SWAPFILE") * 512 ))
    else
       swap_file_actual_size_in_bytes="0"
    fi
 
    local folder_of_swapfile
-   folder_of_swapfile="${SWAPFILE%/*}"
+   folder_of_swapfile="$(swapfile_parent_dir "$SWAPFILE")"
 
    if ! test -d "$folder_of_swapfile" ; then
       log "ERROR: folder_of_swapfile '$folder_of_swapfile' does not exist." >&2
@@ -263,19 +428,17 @@ do_start() {
    fi
 
    if ! test -w "$folder_of_swapfile" ; then
-      true "INFO: File $SWAPFILE (actually folder $folder_of_swapfile) is not writeable. Maybe read-only file system? Exiting."
+      log "INFO: File $SWAPFILE (actually folder $folder_of_swapfile) is not writeable. Maybe read-only file system? Exiting."
       exit 0
    fi
 
-   local swap_file_actual_size_in_mb
-   swap_file_actual_size_in_mb="$(( swap_file_actual_size_in_bytes / 1024 / 1024 ))"
-
-   ## Never mind eventual small platform specific rounding errors.
-   swap_file_actual_size_in_mb="$(( swap_file_actual_size_in_mb + 2 ))"
-
    local total_disk_space_in_mb
-   dirname_swapfile="${SWAPFILE%/*}"
-   total_disk_space_in_mb=$(df "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
+   dirname_swapfile="$folder_of_swapfile"
+   ## df -P: POSIX one-line-per-fs output, so a long mapper device name cannot
+   ## wrap onto a second line and shift the NR==2 fields. -k pins 1K blocks: an
+   ## explicit block size overrides the POSIXLY_CORRECT 512-byte default, which
+   ## would otherwise halve $2's unit and double the computed MB.
+   total_disk_space_in_mb=$(df -P -k "$dirname_swapfile" | awk 'NR==2 {print int($2/1024)}')
 
    local swap_file_target_size_mb
    if [ "$SWAP_FILE_SIZE_CUSTOM_MB" = "" ]; then
@@ -292,50 +455,110 @@ do_start() {
       swap_file_target_size_mb="$SWAP_FILE_SIZE_CUSTOM_MB"
    fi
 
-   local swap_file_size_gb
-   swap_file_size_gb=$(bc <<< "scale=0; $swap_file_target_size_mb / 1024")
-
-   local free_disk_space_in_gb
-   local free_disk_space_in_gb_plus
-   free_disk_space_in_gb=$(df "$dirname_swapfile" | awk 'NR==2 {print int($4/1024/1024)}')
-   free_disk_space_in_gb_plus=$(( free_disk_space_in_gb + 2 ))
-
-   if [ "$swap_file_size_gb" -ge "$free_disk_space_in_gb_plus" ]; then
-      log "ERROR: Only $free_disk_space_in_gb GB free disk space. Insufficient to create $swap_file_size_gb GB sized swap file. Swap file not enabled." >&2
+   ## Validate the resolved config BEFORE do_stop destroys the existing swap: a
+   ## bad size or UUID otherwise fails only AFTER the old working swap is gone,
+   ## leaving the box with none. Normalize the size to base-10 so bc (decimal) and
+   ## $((...)) (which reads a leading zero as OCTAL) cannot disagree; cap at 1 TiB
+   ## to stay inside signed 64-bit. A zero/negative value would otherwise pass the
+   ## free-space gate (required <= 0 fits) and the old swap would be removed before
+   ## allocation fails.
+   if [[ ! "$swap_file_target_size_mb" =~ ^[0-9]+$ ]]; then
+      log "ERROR: swap size '$swap_file_target_size_mb' MB is not a non-negative integer. Swap file not enabled." >&2
+      exit 1
+   fi
+   ## Range-check with bc (arbitrary precision) BEFORE the $((...)) below: a digit
+   ## string larger than signed 64-bit would WRAP in shell arithmetic and could
+   ## land back inside the valid range, defeating the check. bc reads the literal
+   ## decimal (leading zeros included) without wrapping.
+   if [ "$(bc <<< "$swap_file_target_size_mb < 1 || $swap_file_target_size_mb > 1048576")" != '0' ]; then
+      log "ERROR: swap size '$swap_file_target_size_mb' MB is out of range (1..1048576 MiB). Swap file not enabled." >&2
+      exit 1
+   fi
+   ## Normalize to base-10 (a leading zero is OCTAL to $((...)), decimal to bc) so
+   ## the two readings agree; safe now that the value is proven <= 1048576.
+   swap_file_target_size_mb=$((10#$swap_file_target_size_mb))
+   if [[ ! "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      log "ERROR: UUID '$UUID' is not a valid UUID. Swap file not enabled." >&2
       exit 1
    fi
 
+   local swap_file_size_gb
+   swap_file_size_gb=$(bc <<< "scale=0; $swap_file_target_size_mb / 1024")
+
    local swap_file_target_size_bytes
-   swap_file_target_size_bytes=$((swap_file_target_size_mb * 1000000))
+   ## MiB -> bytes. calculate-swap-size works in MiB (it does ram_mb / 1024 to
+   ## get GB), so the multiplier is 1024*1024, not decimal 1000000.
+   swap_file_target_size_bytes=$((swap_file_target_size_mb * 1048576))
+
+   ## Free-space sufficiency check in BYTES. 'df -P --block-size=1' avoids both
+   ## the GiB truncation (which, with the +2 GiB headroom mistakenly added to
+   ## AVAILABLE, could approve a swap ~2 GiB over free) and the POSIXLY_CORRECT
+   ## 512-byte rescale a 1K-block read suffers. Headroom is required ON TOP of
+   ## the target, not added to available. Credit the existing managed swap file's
+   ## ALLOCATED bytes (st_blocks * 512, not apparent size): do_stop reclaims that
+   ## exact path before allocation, so what removing it actually frees is available
+   ## for the new file. A sparse file (e.g. a prior truncate) frees only its
+   ## allocated blocks, so apparent size would over-credit and approve a swap that
+   ## then fails to allocate after the old file is already gone.
+   local free_disk_space_in_bytes effective_free_in_bytes headroom_in_bytes required_in_bytes
+   free_disk_space_in_bytes=$(df -P --block-size=1 "$dirname_swapfile" | awk 'NR==2 {print $4}')
+   headroom_in_bytes=$(( 2 * 1024 * 1024 * 1024 ))
+   effective_free_in_bytes=$(( free_disk_space_in_bytes + swap_file_actual_size_in_bytes ))
+   required_in_bytes=$(( swap_file_target_size_bytes + headroom_in_bytes ))
+
+   if ! swap_fits_free_disk "$required_in_bytes" "$effective_free_in_bytes"; then
+      log "ERROR: Insufficient free disk space: need ${required_in_bytes} bytes (swap ${swap_file_size_gb} GB + 2 GB headroom), have ${effective_free_in_bytes} bytes (${free_disk_space_in_bytes} free + ${swap_file_actual_size_in_bytes} reclaimable). Swap file not enabled." >&2
+      exit 1
+   fi
 
    local swap_file_target_size_gb
    swap_file_target_size_gb="$(bc <<< "scale=2; $swap_file_target_size_bytes/1024/1024/1024")"
    ## Round down to integer.
    swap_file_target_size_gb="$(printf "%.0f" "$swap_file_target_size_gb")"
 
-   do_stop
-
    fileystem_type=$(findmnt --noheadings --output FSTYPE --target "$folder_of_swapfile")
 
+   ## Verify the btrfs tool BEFORE do_stop destroys the existing swap: on a
+   ## btrfs system without btrfs-progs installed (no hard dep, since non-btrfs
+   ## systems do not need it) this fails cleanly instead of leaving no swap at
+   ## all after the old file was already removed.
    if [ "$fileystem_type" = "btrfs" ]; then
-      command -v "btrfs" >/dev/null
+      if ! command -v btrfs >/dev/null; then
+         log "ERROR: btrfs filesystem detected but the 'btrfs' tool is missing. Install btrfs-progs. Swap file not enabled." >&2
+         exit 1
+      fi
+   fi
+
+   ## Abort if do_stop could not deactivate an existing active swap at this
+   ## path: overwriting a live swap file (btrfs mkswapfile / fallocate+mkswap
+   ## below) can corrupt memory. do_stop returns nonzero only when swapoff
+   ## failed to confirm inactivity.
+   if ! do_stop; then
+      log "ERROR: Could not deactivate existing swap at '$SWAPFILE'; refusing to overwrite a possibly-active swap file. Swap file not enabled." >&2
+      exit 1
+   fi
+
+   ## NOT transactional by design: do_stop removed the old swap above, so a failure
+   ## in the create/format/enable steps below -- btrfs mkswapfile can exit 0 yet
+   ## leave an unusable file, fallocate can ENOSPC, a bad MKSWAP_EXTRA/SWAPON_EXTRA
+   ## or a SIGTERM can abort -- leaves the box with no swap and a stray file. The
+   ## cheap-to-catch config errors (size, UUID) are validated BEFORE do_stop; the
+   ## residual create-time failures are rare and a missing swap is non-fatal.
+
+   if [ "$fileystem_type" = "btrfs" ]; then
       ## Need to use 'btrfs'. Otherwise, 'swapon "$SWAPFILE" $SWAPON_EXTRA' would fail with:
       ## > swapon: /var/swapfile: swapon failed: Invalid argument
       ## https://unix.stackexchange.com/questions/599949/swapfile-swapon-invalid-argument
       ## https://btrfs.readthedocs.io/en/latest/Swapfile.html
-      btrfs filesystem mkswapfile --size "${swap_file_target_size_gb}G" "$SWAPFILE"
+      ## Size in BYTES (not rounded GB): a sub-1-GB target rounds to 0G otherwise.
+      ## --uuid applies the configured UUID on btrfs too (the mkswap branch below
+      ## is skipped for btrfs), so 'resume=UUID=' locates the swap as on ext4.
+      btrfs filesystem mkswapfile --uuid "$UUID" --size "$swap_file_target_size_bytes" "$SWAPFILE"
    else
-      ## We need to check the size of $SWAPFILE, because a previous run of fallocate that
-      ## got interrupted for some reason might have only created a smaller file
-      ## (0 MB in worst case).
-      ## fallocate is fast. Maybe no more test needed.
-      #if [ "$swap_file_target_size_mb" -lt "$swap_file_actual_size_in_mb" ]; then
-          ## Not exact.
-          ## For example 6144 MB would only be 5.7 G in "sudo swapon --show".
-          #fallocate --length "${swap_file_target_size_mb}MB" "$SWAPFILE"
-          ## Hence calculate in bytes.
-          fallocate --length "$swap_file_target_size_bytes" "$SWAPFILE"
-      #fi
+      ## Allocate in BYTES, not "${mb}MB": fallocate's MB suffix is decimal, so
+      ## e.g. 6144 MB yields only ~5.7 GiB in 'swapon --show'. do_stop above
+      ## already reclaimed any prior (possibly truncated) file.
+      fallocate --length "$swap_file_target_size_bytes" "$SWAPFILE"
    fi
 
    chown --recursive root:root -- "$SWAPFILE"
@@ -355,24 +578,21 @@ do_start() {
 
    swapon "$SWAPFILE" $SWAPON_EXTRA
 
+   ## Swap is now active. The size self-check below is BEST EFFORT: a failure to
+   ## READ or PARSE the size keeps the enabled swap and skips the check (never
+   ## tears down healthy swap over a cosmetic read), so the enumeration/parse
+   ## are guarded with '|| true'. Only a size proven WRONG rolls back.
    ## /proc/swap does not show the label.
    ## output by swapon_line is not predictable, G vs M as unit.
    local swapon_line
-   swapon_line="$(swapon --noheadings --raw --show=NAME,SIZE)"
-   swapon_line="$(printf '%b' "$swapon_line" | grep --fixed-strings -- "$SWAPFILE" | tail -n1)" || true
+   swapon_line="$(swapon --noheadings --raw --show=NAME,SIZE)" || true
+   swapon_line="$(swapon_record_for "$swapon_line" "$SWAPFILE")" || true
    ## example swapon_line:
    #swapon_line="/var/swapfile 1024M"
-   swap_file_size_with_unit=$(awk '{print $NF}' <<< "$swapon_line")
+   swap_file_size_with_unit=$(awk '{print $NF}' <<< "$swapon_line") || true
 
-   # Check if the size is in GB or MB and convert accordingly
-   if [[ $swap_file_size_with_unit == *G ]]; then
-      # If size ends with 'G', remove the 'G'
-      swap_file_kernel_reported_size_gb=${swap_file_size_with_unit%G}
-   elif [[ $swap_file_size_with_unit == *M ]]; then
-      # If size ends with 'M', remove the 'M' and divide by 1024
-      swap_file_size_in_mb=${swap_file_size_with_unit%M}
-      swap_file_kernel_reported_size_gb=$(bc <<< "scale=2; $swap_file_size_in_mb / 1024")
-   else
+   local swap_file_kernel_reported_size_gb_rounded_up
+   if ! swap_file_kernel_reported_size_gb_rounded_up="$(swap_size_field_to_gb "$swap_file_size_with_unit")"; then
       log "\
 INFO: Minor note (not an error).
 Swap file has been enabled; the size self-check was skipped.
@@ -381,15 +601,18 @@ Output of:
 reported an unexpected unit for file '$SWAPFILE' (not M or G).
 swapon_line: '$swapon_line'
 swap_file_size_with_unit: '$swap_file_size_with_unit'"
+      ## Swap is enabled and kept; only the optional size self-check was skipped.
       return 0
    fi
 
-   swap_file_kernel_reported_size_gb_rounded_up="$(printf "%.0f\n" "$swap_file_kernel_reported_size_gb")"
-
+   ## Deliberately LENIENT: GB rounding plus this +1 tolerates a swap up to ~1 GiB
+   ## under the target, and a non-M/G unit (K/T) skips the check entirely (above).
+   ## Best-effort by design -- a slightly-small swap is kept rather than tearing
+   ## down healthy swap over rounding; only a clearly-wrong size rolls back.
    local swap_file_kernel_reported_size_gb_plus
    swap_file_kernel_reported_size_gb_plus=$(( swap_file_kernel_reported_size_gb_rounded_up + 1 ))
 
-   if [ "$swap_file_kernel_reported_size_gb_plus" -ge "$swap_file_target_size_gb" ]; then
+   if swap_size_self_check_ok "$swap_file_kernel_reported_size_gb_plus" "$swap_file_target_size_gb"; then
       log "INFO: File '$SWAPFILE' ($swap_file_size_gb GB) created and enabled. OK."
       return 0
    fi
@@ -397,39 +620,73 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
    log "ERROR: swap_file_kernel_reported_size_gb_plus is smaller than expected swap_file_target_size_gb!" >&2
    log "swap_file_kernel_reported_size_gb_plus: '$swap_file_kernel_reported_size_gb_plus'" >&2
    log "swap_file_target_size_gb: '$swap_file_target_size_gb'" >&2
+   ## Mis-sized swap is a failed start: roll it back instead of leaving a
+   ## wrong-size active swap behind the error.
+   swap_rollback
    exit 1
 }
 
-if [ "$live_status_detected" = "true" ]; then
-  true "INFO: live mode detected. Swap file creation skipped."
-  exit 0
+main() {
+   set -o errexit
+   set -o nounset
+   set -o pipefail
+   set -o errtrace
+   shopt -s inherit_errexit
+   shopt -s shift_verbose
+
+   ## https://forums.whonix.org/t/swap-file-creator-error/21128/3
+   ## avoid printf error "bash: printf: 3.14: invalid number".
+   ## LANG=C does not suffice:
+   ## https://unix.stackexchange.com/questions/576701/what-is-the-difference-between-lang-c-and-lc-all-c
+   export LC_ALL=C
+
+   ## Ignore SIGPIPE: a broken stdout/stderr pipe (output piped to a reader that
+   ## exited) then returns EPIPE to the writer instead of killing the shell, so
+   ## log()'s '|| true' guards keep the logger fail-safe even on a dead pipe (a
+   ## bare '|| true' cannot run after a SIGPIPE has already terminated the shell).
+   trap '' PIPE
+   trap "error_handler" ERR
+   trap exit_handler EXIT
+
+   ## sets: live_status_detected
+   source /usr/libexec/helper-scripts/live-mode.sh
+
+   if [ "$live_status_detected" = "true" ]; then
+      true "INFO: live mode detected. Swap file creation skipped."
+      exit 0
+   fi
+
+   sanity_tests
+   source_config_files
+   set_defaults
+
+   if ! [ "$(id -u)" = 0 ]; then
+      log "$0: ERROR: Must be run as root/sudo." >&2
+      exit 1
+   fi
+
+   if [ $# -eq 0 ]; then
+      log "ERROR: No arguments provided." >&2
+      log "Usage: $0 (start|stop)" >&2
+      exit 1
+   fi
+
+   case "$1" in
+      start)
+         do_start
+         ;;
+      stop)
+         do_stop
+         ;;
+      *)
+         log "ERROR: Invalid argument: $1" >&2
+         log "Usage: $0 (start|stop)" >&2
+         exit 1
+         ;;
+   esac
+}
+
+## Only auto-run when executed, not when sourced (unit tests source it).
+if was_executed "${BASH_SOURCE[0]}"; then
+   main "$@"
 fi
-
-sanity_tests
-source_config_files
-set_defaults
-
-if ! [ "$(id -u)" = 0 ]; then
-    log "$0: ERROR: Must be run as root/sudo." >&2
-    exit 1
-fi
-
-if [ $# -eq 0 ]; then
-    log "ERROR: No arguments provided." >&2
-    log "Usage: $0 (start|stop)" >&2
-    exit 1
-fi
-
-case "$1" in
-    start)
-        do_start
-        ;;
-    stop)
-        do_stop
-        ;;
-    *)
-        log "ERROR: Invalid argument: $1" >&2
-        log "Usage: $0 (start|stop)" >&2
-        exit 1
-        ;;
-esac
