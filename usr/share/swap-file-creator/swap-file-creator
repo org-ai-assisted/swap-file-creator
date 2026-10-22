@@ -454,11 +454,17 @@ do_start() {
       log "ERROR: swap size '$swap_file_target_size_mb' MB is not a non-negative integer. Swap file not enabled." >&2
       exit 1
    fi
-   swap_file_target_size_mb=$((10#$swap_file_target_size_mb))
-   if [ "$swap_file_target_size_mb" -lt 1 ] || [ "$swap_file_target_size_mb" -gt 1048576 ]; then
+   ## Range-check with bc (arbitrary precision) BEFORE the $((...)) below: a digit
+   ## string larger than signed 64-bit would WRAP in shell arithmetic and could
+   ## land back inside the valid range, defeating the check. bc reads the literal
+   ## decimal (leading zeros included) without wrapping.
+   if [ "$(bc <<< "$swap_file_target_size_mb < 1 || $swap_file_target_size_mb > 1048576")" != '0' ]; then
       log "ERROR: swap size '$swap_file_target_size_mb' MB is out of range (1..1048576 MiB). Swap file not enabled." >&2
       exit 1
    fi
+   ## Normalize to base-10 (a leading zero is OCTAL to $((...)), decimal to bc) so
+   ## the two readings agree; safe now that the value is proven <= 1048576.
+   swap_file_target_size_mb=$((10#$swap_file_target_size_mb))
    if [[ ! "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
       log "ERROR: UUID '$UUID' is not a valid UUID. Swap file not enabled." >&2
       exit 1
