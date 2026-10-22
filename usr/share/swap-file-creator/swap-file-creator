@@ -314,6 +314,15 @@ do_stop() {
       return 1
    fi
 
+   ## A zero safe-rm status is not proof of removal: safe-rm FILTERS a protected
+   ## operand (SWAPFILE listed in safe-rm config) and then runs 'rm --force' with
+   ## no operands, which exits 0. Verify the path is actually gone and fail closed
+   ## on the OUTCOME, or do_start would recreate swap over the undeleted file.
+   if [ -e "$SWAPFILE" ]; then
+      log "ERROR: Swap file '$SWAPFILE' still present after safe-rm (protected path?)." >&2
+      return 1
+   fi
+
    return 0
 }
 
