@@ -250,14 +250,17 @@ do_stop() {
       log "ERROR: 'SWAPFILE' value '$SWAPFILE' is not an absolute path. Refusing to operate." >&2
       return 1
    fi
-   ## Match the swapon listing VERBATIM -- no 'printf %b' decode. A path field
-   ## containing a backslash escape ('\c' truncates printf, '\040'/'\n' rewrite it)
-   ## must not be reinterpreted: a decode could hide an ACTIVE configured swap and
-   ## let it be removed WITHOUT a swapoff (live-swap deletion). A path that does
-   ## not match verbatim leaves swap_is_active 'unknown' -> swapoff is required and
-   ## must succeed before removal (fail closed). Keep SWAPFILE a plain root-owned
-   ## path with no whitespace; a pathological path simply won't match verbatim and
-   ## falls through to the swapoff-confirmed path.
+   ## Match the swapon listing VERBATIM -- no 'printf %b' decode, which an escape
+   ## in ANY listed record ('\c' truncates printf, '\040'/'\n'/'\x5c' rewrite it)
+   ## could steer to hide this swap. A path NOT found here is treated as INACTIVE
+   ## and removed below WITHOUT a swapoff. That is correct for the SUPPORTED config
+   ## -- a plain, canonical, whitespace-free root-owned path, which the kernel
+   ## lists verbatim, so an ACTIVE such swap always matches and takes the
+   ## swapoff-confirmed path. An escaped / non-canonical ('/var/./swapfile') /
+   ## whitespace SWAPFILE (unsupported) may not match its own listing; if active,
+   ## safe-rm is attempted, but the kernel refuses to unlink a live swap
+   ## (IS_SWAPFILE -> EPERM), so do_stop fails and start aborts rather than
+   ## corrupting. Keep SWAPFILE a plain canonical path.
    swapoff_exitcode='0'
    swapon_listing_ok='yes'
    swapon_output="$(swapon 2>/dev/null)" || swapon_listing_ok='no'
@@ -628,6 +631,11 @@ main() {
    ## https://unix.stackexchange.com/questions/576701/what-is-the-difference-between-lang-c-and-lc-all-c
    export LC_ALL=C
 
+   ## Ignore SIGPIPE: a broken stdout/stderr pipe (output piped to a reader that
+   ## exited) then returns EPIPE to the writer instead of killing the shell, so
+   ## log()'s '|| true' guards keep the logger fail-safe even on a dead pipe (a
+   ## bare '|| true' cannot run after a SIGPIPE has already terminated the shell).
+   trap '' PIPE
    trap "error_handler" ERR
    trap exit_handler EXIT
 
