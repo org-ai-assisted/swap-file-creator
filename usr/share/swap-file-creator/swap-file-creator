@@ -402,7 +402,7 @@ do_start() {
    if [ -f "$SWAPFILE" ]; then
       ## Sanity test.
       test -r "$SWAPFILE"
-      swap_file_actual_size_in_bytes="$(stat --format='%s' -- "$SWAPFILE")"
+      swap_file_actual_size_in_bytes=$(( $(stat --format='%b' -- "$SWAPFILE") * 512 ))
    else
       swap_file_actual_size_in_bytes="0"
    fi
@@ -482,10 +482,12 @@ do_start() {
    ## the GiB truncation (which, with the +2 GiB headroom mistakenly added to
    ## AVAILABLE, could approve a swap ~2 GiB over free) and the POSIXLY_CORRECT
    ## 512-byte rescale a 1K-block read suffers. Headroom is required ON TOP of
-   ## the target, not added to available. Credit the existing managed swap
-   ## file's bytes: do_stop reclaims that exact path before allocation, so its
-   ## current size is free for the new file -- a restart on a full-ish disk is
-   ## idempotent instead of falsely failing.
+   ## the target, not added to available. Credit the existing managed swap file's
+   ## ALLOCATED bytes (st_blocks * 512, not apparent size): do_stop reclaims that
+   ## exact path before allocation, so what removing it actually frees is available
+   ## for the new file. A sparse file (e.g. a prior truncate) frees only its
+   ## allocated blocks, so apparent size would over-credit and approve a swap that
+   ## then fails to allocate after the old file is already gone.
    local free_disk_space_in_bytes effective_free_in_bytes headroom_in_bytes required_in_bytes
    free_disk_space_in_bytes=$(df -P --block-size=1 "$dirname_swapfile" | awk 'NR==2 {print $4}')
    headroom_in_bytes=$(( 2 * 1024 * 1024 * 1024 ))
@@ -524,13 +526,22 @@ do_start() {
       exit 1
    fi
 
+   ## NOT transactional by design: do_stop removed the old swap above, so a failure
+   ## in the create/format/enable steps below -- btrfs mkswapfile can exit 0 yet
+   ## leave an unusable file, fallocate can ENOSPC, a bad MKSWAP_EXTRA/SWAPON_EXTRA
+   ## or a SIGTERM can abort -- leaves the box with no swap and a stray file. The
+   ## cheap-to-catch config errors (size, UUID) are validated BEFORE do_stop; the
+   ## residual create-time failures are rare and a missing swap is non-fatal.
+
    if [ "$fileystem_type" = "btrfs" ]; then
       ## Need to use 'btrfs'. Otherwise, 'swapon "$SWAPFILE" $SWAPON_EXTRA' would fail with:
       ## > swapon: /var/swapfile: swapon failed: Invalid argument
       ## https://unix.stackexchange.com/questions/599949/swapfile-swapon-invalid-argument
       ## https://btrfs.readthedocs.io/en/latest/Swapfile.html
       ## Size in BYTES (not rounded GB): a sub-1-GB target rounds to 0G otherwise.
-      btrfs filesystem mkswapfile --size "$swap_file_target_size_bytes" "$SWAPFILE"
+      ## --uuid applies the configured UUID on btrfs too (the mkswap branch below
+      ## is skipped for btrfs), so 'resume=UUID=' locates the swap as on ext4.
+      btrfs filesystem mkswapfile --uuid "$UUID" --size "$swap_file_target_size_bytes" "$SWAPFILE"
    else
       ## Allocate in BYTES, not "${mb}MB": fallocate's MB suffix is decimal, so
       ## e.g. 6144 MB yields only ~5.7 GiB in 'swapon --show'. do_stop above
@@ -582,6 +593,10 @@ swap_file_size_with_unit: '$swap_file_size_with_unit'"
       return 0
    fi
 
+   ## Deliberately LENIENT: GB rounding plus this +1 tolerates a swap up to ~1 GiB
+   ## under the target, and a non-M/G unit (K/T) skips the check entirely (above).
+   ## Best-effort by design -- a slightly-small swap is kept rather than tearing
+   ## down healthy swap over rounding; only a clearly-wrong size rolls back.
    local swap_file_kernel_reported_size_gb_plus
    swap_file_kernel_reported_size_gb_plus=$(( swap_file_kernel_reported_size_gb_rounded_up + 1 ))
 
