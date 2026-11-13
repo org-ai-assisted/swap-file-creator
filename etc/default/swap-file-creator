@@ -16,20 +16,6 @@
 ## no
 #VERBOSE="no"
 
-## Delete swapfile on shut down.
-## defaults to:
-## no
-## possible values:
-## yes
-## no
-#SHRED_ON_STOP="yes"
-
-## shred options
-#SHRED_OPTS="--verbose --iterations=3"
-
-## shred extra options
-#SHRED_EXTRA=""
-
 ## No change required unless you know what you are doing.
 #UUID="0615ba72-85b0-4183-8d54-300bb0d2e491"
 
@@ -43,9 +29,6 @@
 #SWAPON_EXTRA=""
 
 ## No change required unless you know what you are doing.
-#SWAPOFF_EXTRA=""
-
-## No change required unless you know what you are doing.
 #SWAPON_EXTRA="--verbose"
 
 ## No change required unless you know what you are doing.
@@ -56,8 +39,9 @@
 ## Currently does nothing.
 #MAPPER_FULL="/dev/mapper/$MAPPER"
 
-## Pass 'yes' or 'no' to calculate-swap-size.
-## Otherwise auto detected. 'no' in VMs. 'yes' otherwise.
+## Pass 'yes' or 'no' to calculate-swap-size for hibernation sizing.
+## Auto-detected default is 'no' (hibernation sizing disabled, VMs and
+## bare metal alike). Set 'yes' to size swap for hibernation.
 #HIBERNATION="no"
 
 ## Pass 'yes' or 'no' to enable or disable both:

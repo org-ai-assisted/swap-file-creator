@@ -12,9 +12,8 @@ The tool is particularly useful for systems with low RAM, such as virtual
 machines, where lack of swap may cause freezing during upgrades or heavy
 memory operations.
 
-The swap file can be shredded on shutdown for additional privacy, if
-enabled. Various parameters, including file path, custom size, and
-pre-checks, can be configured through /etc/default/swap-file-creator.
+Various parameters, including file path, custom size, and pre-checks, can
+be configured through /etc/default/swap-file-creator.
 
 Earlier versions provided an additional dm-crypt layer and created a
 swap file encrypted with an ephemeral key. Due to a Linux kernel bug,
