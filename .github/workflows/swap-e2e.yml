@@ -60,6 +60,18 @@ jobs:
       - name: install dependencies
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends btrfs-progs util-linux bc python3 safe-rm
 
+      ## The subject sources helper-scripts live-mode.sh, which runs its sibling
+      ## /usr/libexec/helper-scripts/get_writable_fs_lists.sh via that hardcoded
+      ## installed path (not HELPER_SCRIPTS_PATH). On a bare runner helper-scripts
+      ## is only a checkout, so symlink it to the production location -- modelling
+      ## an installed system, where that absolute path resolves.
+      - name: expose helper-scripts at its installed path
+        run: |
+          sudo mkdir --parents /usr/libexec
+          sudo ln --symbolic --force --no-target-directory \
+            "${GITHUB_WORKSPACE}/helper-scripts/usr/libexec/helper-scripts" \
+            /usr/libexec/helper-scripts
+
       - name: run real-kernel swap e2e (root)
         run: |
           sudo env \
